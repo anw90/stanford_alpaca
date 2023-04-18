@@ -21,7 +21,6 @@ import torch
 import transformers
 import utils
 from torch.utils.data import Dataset
-from transformers import Trainer
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -129,6 +128,7 @@ class SupervisedDataset(Dataset):
 
     def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
+        self.tokenizer = tokenizer
         logging.warning("Loading data...")
         list_data_dict = utils.jload(data_path)
 
@@ -194,6 +194,7 @@ def train():
         model_max_length=training_args.model_max_length,
         padding_side="right",
         use_fast=False,
+        padding=True
     )
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
@@ -211,11 +212,41 @@ def train():
         model=model,
     )
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
-    trainer.train()
-    trainer.save_state()
-    trainer.save_model(output_dir=training_args.output_dir)
+    tokenizer.model_max_length = 1024
+    tokenizer.pad_token = tokenizer.eos_token
+    model.config.end_token_id = tokenizer.eos_token_id
+    model.config.pad_token_id = model.config.eos_token_id
+
+    # data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    # data_collator = transformers.DataCollatorWithPadding(tokenizer)
+    loader = torch.utils.data.DataLoader(train_dataset, batch_size=2, collate_fn=data_collator)
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    device = xm.xla_device()
+    loader = pl.MpDeviceLoader(loader, device)
+    # device = torch.device("cuda:0")
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    for step, batch in enumerate(loader):
+        import pdb; pdb.set_trace()
+        optimizer.zero_grad()
+        # for key in batch:
+        #     batch[key] = batch[key].to(device)
+        outputs = model(**batch)
+        loss = outputs['loss']
+
+        loss.backward()
+        optimizer.step()
+        # xm.mark_step()
+        if step % 1 == 0: print('step: %d, loss: %f' % (step, loss))
+
+
+    # trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    # trainer.train()
+    # trainer.save_state()
+    # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
